@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - develop
+  schedule:
+    # Rebuild after both forks' upstream-sync jobs so frontend-only updates
+    # are embedded even when the backend branch itself did not change.
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 permissions:
