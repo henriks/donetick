@@ -7,11 +7,11 @@ on:
   schedule:
     # Rebuild after both forks' upstream-sync jobs so frontend-only updates
     # are embedded even when the backend branch itself did not change.
-    - cron: '0 3 * * *'
+    - cron: '45 * * * *'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -35,7 +35,28 @@ jobs:
           ref: develop
           path: frontend-code
 
+      - name: Check revision pair
+        id: revisions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          backend_sha=$(git rev-parse HEAD)
+          frontend_sha=$(git -C frontend-code rev-parse HEAD)
+          release_tag="image-${backend_sha:0:12}-${frontend_sha:0:12}"
+
+          echo "backend_sha=${backend_sha}" >> "$GITHUB_OUTPUT"
+          echo "frontend_sha=${frontend_sha}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Image already released for backend ${backend_sha} and frontend ${frontend_sha}"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Node.js
+        if: steps.revisions.outputs.should_build == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 23
@@ -43,20 +64,24 @@ jobs:
           cache-dependency-path: frontend-code/package-lock.json
 
       - name: Build self-hosted frontend
+        if: steps.revisions.outputs.should_build == 'true'
         working-directory: frontend-code
         run: |
           npm ci
           npm run build -- --mode selfhosted
 
       - name: Stage embedded frontend
+        if: steps.revisions.outputs.should_build == 'true'
         run: |
           find frontend/dist -mindepth 1 -delete
           cp -R frontend-code/dist/. frontend/dist/
 
       - name: Set up Docker Buildx
+        if: steps.revisions.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.revisions.outputs.should_build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -64,6 +89,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate image metadata
+        if: steps.revisions.outputs.should_build == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -71,8 +97,10 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-
+            type=raw,value=${{ steps.revisions.outputs.release_tag }}
 
       - name: Build and publish image
+        if: steps.revisions.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -82,6 +110,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=patched
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ steps.revisions.outputs.backend_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record published revision pair
+        if: steps.revisions.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.revisions.outputs.release_tag }}
+          BACKEND_SHA: ${{ steps.revisions.outputs.backend_sha }}
+          FRONTEND_SHA: ${{ steps.revisions.outputs.frontend_sha }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BACKEND_SHA" \
+            --title "Patched image ${RELEASE_TAG}" \
+            --notes "Backend: ${BACKEND_SHA}; Frontend: ${FRONTEND_SHA}; Image: ${IMAGE_NAME}:${RELEASE_TAG}"
